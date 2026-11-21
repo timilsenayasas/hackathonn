@@ -12,40 +12,6 @@ pub struct Slot {
     pub v: u32,
     _p: u32,
 }
-pub struct KTab {
-    mask: usize,
-    pub slots: Vec<Slot>,
-}
-impl KTab {
-    pub fn with_size_for(n: usize, load: f64) -> KTab {
-        let size = (((n as f64) / load) as usize + 1).next_power_of_two().max(16);
-        KTab {
-            mask: size - 1,
-            slots: vec![Slot { k: EMPTY, v: 0, _p: 0 }; size],
-        }
-    }
-    #[inline(always)]
-    fn idx(&self, k: u64) -> usize {
-        hash64b(k) as usize & self.mask
-    }
-    #[inline(always)]
-    pub fn get_or_insert(&mut self, k: u64, v: u32) -> (u32, bool) {
-        let mut i = self.idx(k);
-        loop {
-            let s = &mut self.slots[i];
-            if s.k == k {
-                return (s.v, false);
-            }
-            if s.k == EMPTY {
-                s.k = k;
-                s.v = v;
-                return (v, true);
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-}
-
 pub struct Links {
     slots: Vec<Slot>,
     smask: usize,
@@ -148,7 +114,14 @@ pub fn build(maps: &[Mapped], it: &Interner, nt: usize) -> Links {
     }
     struct L1 {
         edges: Vec<(u64, u64)>,
-        buckets: Vec<Vec<(u64, u32)>>,
+        // endpoints grouped by shard: shard s is flat[off[s]..off[s + 1]]
+        flat: Vec<(u64, u32)>,
+        off: Vec<u32>,
+    }
+    impl L1 {
+        fn bucket(&self, s: usize) -> &[(u64, u32)] {
+            &self.flat[self.off[s] as usize..self.off[s + 1] as usize]
+        }
     }
     let l1: Vec<Mutex<Option<L1>>> = (0..tasks.len()).map(|_| Mutex::new(None)).collect();
     par(nt, tasks.len(), |t| {
@@ -161,12 +134,27 @@ pub fn build(maps: &[Mapped], it: &Interner, nt: usize) -> Links {
             }
             v.push((id_key(f[0], it), id_key(f[1], it)));
         });
-        let mut buckets: Vec<Vec<(u64, u32)>> = (0..s_count).map(|_| Vec::with_capacity(v.len() * 2 / s_count + 8)).collect();
-        for (j, &(a, b)) in v.iter().enumerate() {
-            buckets[(hash64(a) >> sshift) as usize].push((a, (2 * j) as u32));
-            buckets[(hash64(b) >> sshift) as usize].push((b, (2 * j + 1) as u32));
+        // two allocations per chunk instead of one per shard: each small allocation used to
+        // grow the thread's heap with its own mprotect, which stalls page faults in every thread
+        let mut off = vec![0u32; s_count + 1];
+        for &(a, b) in &v {
+            off[(hash64(a) >> sshift) as usize + 1] += 1;
+            off[(hash64(b) >> sshift) as usize + 1] += 1;
         }
-        *l1[t].lock().unwrap() = Some(L1 { edges: v, buckets });
+        for i in 0..s_count {
+            off[i + 1] += off[i];
+        }
+        let mut pos: Vec<u32> = off[..s_count].to_vec();
+        let mut flat = vec![(0u64, 0u32); 2 * v.len()];
+        for (j, &(a, b)) in v.iter().enumerate() {
+            let sa = (hash64(a) >> sshift) as usize;
+            flat[pos[sa] as usize] = (a, (2 * j) as u32);
+            pos[sa] += 1;
+            let sb = (hash64(b) >> sshift) as usize;
+            flat[pos[sb] as usize] = (b, (2 * j + 1) as u32);
+            pos[sb] += 1;
+        }
+        *l1[t].lock().unwrap() = Some(L1 { edges: v, flat, off });
     });
     let l1: Vec<L1> = l1.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
     let edges: Vec<&Vec<(u64, u64)>> = l1.iter().map(|x| &x.edges).collect();
@@ -177,28 +165,28 @@ pub fn build(maps: &[Mapped], it: &Interner, nt: usize) -> Links {
         .iter()
         .map(|v| (0..v.len() * 2).map(|_| AtomicU32::new(0)).collect())
         .collect();
-    let shard_out: Vec<Mutex<Option<(KTab, Vec<u64>)>>> = (0..s_count).map(|_| Mutex::new(None)).collect();
+    // node ids per shard by sorting the shard's endpoints (no hash table, nothing big to zero)
+    let shard_out: Vec<Mutex<Vec<u64>>> = (0..s_count).map(|_| Mutex::new(Vec::new())).collect();
     par(nt, s_count, |s| {
-        let cnt: usize = l1.iter().map(|x| x.buckets[s].len()).sum();
-        let mut tab = KTab::with_size_for(cnt + 16, 0.7);
-        let mut keys: Vec<u64> = Vec::with_capacity(cnt / 2 + 16);
+        let cnt: usize = l1.iter().map(|x| x.bucket(s).len()).sum();
+        let mut v: Vec<(u64, u32, u32)> = Vec::with_capacity(cnt);
         for (w, x) in l1.iter().enumerate() {
-            for &(k, ep) in &x.buckets[s] {
-                let (l, ins) = tab.get_or_insert(k, keys.len() as u32);
-                if ins {
-                    keys.push(k);
-                }
-                ends[w][ep as usize].store(((l as usize) << sbits | s) as u32, Relaxed);
+            for &(k, ep) in x.bucket(s) {
+                v.push((k, w as u32, ep));
             }
         }
-        *shard_out[s].lock().unwrap() = Some((tab, keys));
+        v.sort_unstable_by_key(|e| e.0);
+        let mut keys: Vec<u64> = Vec::with_capacity(cnt / 2 + 16);
+        for &(k, w, ep) in &v {
+            if keys.last() != Some(&k) {
+                keys.push(k);
+            }
+            let l = keys.len() - 1;
+            ends[w as usize][ep as usize].store(((l << sbits) | s) as u32, Relaxed);
+        }
+        *shard_out[s].lock().unwrap() = keys;
     });
-    let mut skeys: Vec<Vec<u64>> = Vec::with_capacity(s_count);
-    for m in shard_out {
-        let (t, k) = m.into_inner().unwrap().unwrap();
-        std::mem::forget(t);
-        skeys.push(k);
-    }
+    let skeys: Vec<Vec<u64>> = shard_out.into_iter().map(|m| m.into_inner().unwrap()).collect();
     let maxl = skeys.iter().map(|k| k.len()).max().unwrap_or(0);
     let ngid = (maxl << sbits).max(1);
     assert!(ngid < u32::MAX as usize);

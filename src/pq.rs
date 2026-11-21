@@ -1,20 +1,4 @@
-pub enum Col<'a> {
-    I32 {
-        name: &'a str,
-        date: bool,
-        v: &'a [i32],
-    },
-    I64 {
-        name: &'a str,
-        v: &'a [i64],
-    },
-    Str {
-        name: &'a str,
-        data: &'a [u8],
-        offs: &'a [u32],
-        valid: Option<&'a [bool]>,
-    },
-}
+use std::io::Write;
 
 struct T {
     b: Vec<u8>,
@@ -22,10 +6,7 @@ struct T {
 }
 impl T {
     fn new() -> T {
-        T {
-            b: Vec::new(),
-            last: vec![0],
-        }
+        T { b: Vec::new(), last: vec![0] }
     }
     fn varint(&mut self, mut v: u64) {
         while v >= 0x80 {
@@ -74,9 +55,6 @@ impl T {
     }
     fn list(&mut self, id: i16, elem: u8, n: usize) {
         self.fh(id, 9);
-        self.list_hdr(elem, n);
-    }
-    fn list_hdr(&mut self, elem: u8, n: usize) {
         if n < 15 {
             self.b.push(((n as u8) << 4) | elem);
         } else {
@@ -86,164 +64,297 @@ impl T {
     }
 }
 
-struct Meta {
-    ptype: i32,
-    name: String,
-    num_values: i64,
-    offset: i64,
+#[derive(Clone, Copy, PartialEq)]
+pub enum Kind {
+    I64,
+    Date,
+    Str,
+}
+
+struct ColMeta {
+    name: &'static str,
+    kind: Kind,
+    optional: bool,
+    dict: bool,
+    dict_off: i64,
+    data_off: i64,
     size: i64,
 }
 
-// bare-bones parquet: one row group, one plain uncompressed page per column
-pub fn write(path: &std::path::Path, nrows: usize, cols: &[Col]) -> std::io::Result<()> {
-    let mut f: Vec<u8> = Vec::with_capacity(64 + nrows * 48);
-    f.extend_from_slice(b"PAR1");
-    let mut metas: Vec<Meta> = Vec::new();
-    for c in cols {
-        let mut body: Vec<u8> = Vec::new();
-        let (ptype, name) = match c {
-            Col::I32 { name, v, .. } => {
-                body.reserve(v.len() * 4);
-                for x in v.iter() {
-                    body.extend_from_slice(&x.to_le_bytes());
-                }
-                (1, *name)
-            }
-            Col::I64 { name, v } => {
-                body.reserve(v.len() * 8);
-                for x in v.iter() {
-                    body.extend_from_slice(&x.to_le_bytes());
-                }
-                (2, *name)
-            }
-            Col::Str { name, data, offs, valid } => {
-                if let Some(valid) = valid {
-                    let groups = (nrows + 7) / 8;
-                    let mut lv: Vec<u8> = Vec::with_capacity(groups + 10);
-                    let mut h = ((groups as u64) << 1) | 1;
-                    while h >= 0x80 {
-                        lv.push((h as u8) | 0x80);
-                        h >>= 7;
-                    }
-                    lv.push(h as u8);
-                    let start = lv.len();
-                    lv.resize(start + groups, 0);
-                    for (i, &ok) in valid.iter().enumerate() {
-                        if ok {
-                            lv[start + (i >> 3)] |= 1 << (i & 7);
-                        }
-                    }
-                    body.extend_from_slice(&(lv.len() as u32).to_le_bytes());
-                    body.extend_from_slice(&lv);
-                }
-                body.reserve(data.len() + offs.len() * 4);
-                for i in 0..offs.len() - 1 {
-                    if let Some(valid) = valid {
-                        if !valid[i] {
-                            continue;
-                        }
-                    }
-                    let s = &data[offs[i] as usize..offs[i + 1] as usize];
-                    body.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                    body.extend_from_slice(s);
-                }
-                (6, *name)
-            }
-        };
-        let mut t = T::new();
-        t.i32f(1, 0); // data page
-        t.i32f(2, body.len() as i32);
-        t.i32f(3, body.len() as i32);
-        t.begin(5);
-        t.i32f(1, nrows as i32);
-        t.i32f(2, 0);
-        t.i32f(3, 3);
-        t.i32f(4, 3);
-        t.end();
-        t.b.push(0);
-        let offset = f.len() as i64;
-        f.extend_from_slice(&t.b);
-        f.extend_from_slice(&body);
-        metas.push(Meta {
-            ptype,
-            name: name.to_string(),
-            num_values: nrows as i64,
-            offset,
-            size: f.len() as i64 - offset,
-        });
+// bare-bones parquet: one row group, an optional dictionary page plus one data page per column
+pub struct Writer {
+    f: std::io::BufWriter<std::fs::File>,
+    pos: i64,
+    nrows: usize,
+    cols: Vec<ColMeta>,
+    body: Vec<u8>,
+}
+
+fn bits_for(n: usize) -> u32 {
+    if n <= 2 {
+        1
+    } else {
+        usize::BITS - (n - 1).leading_zeros()
     }
-    let mut t = T::new();
-    t.i32f(1, 1);
-    t.list(2, 12, cols.len() + 1);
-    t.begin_elem();
-    t.strf(4, b"schema");
-    t.i32f(5, cols.len() as i32);
-    t.end();
-    for c in cols {
+}
+
+// RLE/bit-packed hybrid as a single bit-packed run
+fn bitpack(out: &mut Vec<u8>, n: usize, bw: u32, mut val: impl FnMut(usize) -> u32) {
+    let groups = (n + 7) / 8;
+    let mut h = ((groups as u64) << 1) | 1;
+    while h >= 0x80 {
+        out.push((h as u8) | 0x80);
+        h >>= 7;
+    }
+    out.push(h as u8);
+    let mut acc: u64 = 0;
+    let mut nb: u32 = 0;
+    for i in 0..groups * 8 {
+        let v = if i < n { val(i) as u64 } else { 0 };
+        acc |= v << nb;
+        nb += bw;
+        while nb >= 8 {
+            out.push(acc as u8);
+            acc >>= 8;
+            nb -= 8;
+        }
+    }
+    if nb > 0 {
+        out.push(acc as u8);
+    }
+}
+
+impl Writer {
+    pub fn create(path: &std::path::Path, nrows: usize) -> std::io::Result<Writer> {
+        let mut f = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
+        f.write_all(b"PAR1")?;
+        Ok(Writer { f, pos: 4, nrows, cols: Vec::new(), body: Vec::new() })
+    }
+
+    fn page(&mut self, dict_values: Option<usize>) -> std::io::Result<i64> {
+        let mut t = T::new();
+        match dict_values {
+            Some(nv) => {
+                t.i32f(1, 2);
+                t.i32f(2, self.body.len() as i32);
+                t.i32f(3, self.body.len() as i32);
+                t.begin(7);
+                t.i32f(1, nv as i32);
+                t.i32f(2, 0);
+                t.end();
+            }
+            None => {
+                t.i32f(1, 0);
+                t.i32f(2, self.body.len() as i32);
+                t.i32f(3, self.body.len() as i32);
+                t.begin(5);
+                t.i32f(1, self.nrows as i32);
+                t.i32f(2, if self.cols.last().map_or(false, |c| c.dict) { 8 } else { 0 });
+                t.i32f(3, 3);
+                t.i32f(4, 3);
+                t.end();
+            }
+        }
+        t.b.push(0);
+        let off = self.pos;
+        self.f.write_all(&t.b)?;
+        self.f.write_all(&self.body)?;
+        self.pos += (t.b.len() + self.body.len()) as i64;
+        Ok(off)
+    }
+
+    fn begin_col(&mut self, name: &'static str, kind: Kind, optional: bool, dict: bool) {
+        self.cols.push(ColMeta { name, kind, optional, dict, dict_off: 0, data_off: 0, size: 0 });
+    }
+
+    fn end_col(&mut self, start: i64) {
+        let c = self.cols.last_mut().unwrap();
+        c.size = self.pos - start;
+    }
+
+    pub fn plain_i64(&mut self, name: &'static str, v: impl Iterator<Item = i64>) -> std::io::Result<()> {
+        self.begin_col(name, Kind::I64, false, false);
+        let start = self.pos;
+        self.body.clear();
+        for x in v {
+            self.body.extend_from_slice(&x.to_le_bytes());
+        }
+        let off = self.page(None)?;
+        self.cols.last_mut().unwrap().data_off = off;
+        self.end_col(start);
+        Ok(())
+    }
+
+    pub fn plain_str<'a>(&mut self, name: &'static str, v: impl Iterator<Item = &'a [u8]>) -> std::io::Result<()> {
+        self.begin_col(name, Kind::Str, false, false);
+        let start = self.pos;
+        self.body.clear();
+        for s in v {
+            self.body.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            self.body.extend_from_slice(s);
+        }
+        let off = self.page(None)?;
+        self.cols.last_mut().unwrap().data_off = off;
+        self.end_col(start);
+        Ok(())
+    }
+
+    fn dict_data(&mut self, ndict: usize, valid: Option<&dyn Fn(usize) -> bool>, idx: &dyn Fn(usize) -> u32) -> std::io::Result<()> {
+        let n = self.nrows;
+        self.body.clear();
+        let bw = bits_for(ndict);
+        let mut nvals = n;
+        if let Some(ok) = valid {
+            let mut lv = Vec::new();
+            bitpack(&mut lv, n, 1, |i| ok(i) as u32);
+            self.body.extend_from_slice(&(lv.len() as u32).to_le_bytes());
+            self.body.extend_from_slice(&lv);
+            nvals = (0..n).filter(|&i| ok(i)).count();
+            self.body.push(bw as u8);
+            let rows: Vec<u32> = (0..n).filter(|&i| ok(i)).map(|i| idx(i)).collect();
+            let mut b = std::mem::take(&mut self.body);
+            bitpack(&mut b, nvals, bw, |j| rows[j]);
+            self.body = b;
+        } else {
+            self.body.push(bw as u8);
+            let mut b = std::mem::take(&mut self.body);
+            bitpack(&mut b, nvals, bw, idx);
+            self.body = b;
+        }
+        let off = self.page(None)?;
+        self.cols.last_mut().unwrap().data_off = off;
+        Ok(())
+    }
+
+    /// dictionary-encoded INT64 (or DATE as INT32) column
+    pub fn dict_int(&mut self, name: &'static str, kind: Kind, dict: &[i64], idx: &dyn Fn(usize) -> u32) -> std::io::Result<()> {
+        self.begin_col(name, kind, false, true);
+        let start = self.pos;
+        self.body.clear();
+        for &x in dict {
+            if kind == Kind::Date {
+                self.body.extend_from_slice(&(x as i32).to_le_bytes());
+            } else {
+                self.body.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        let off = self.page(Some(dict.len()))?;
+        self.cols.last_mut().unwrap().dict_off = off;
+        self.dict_data(dict.len(), None, idx)?;
+        self.end_col(start);
+        Ok(())
+    }
+
+    /// dictionary-encoded string column; `valid` = Some for an OPTIONAL column
+    pub fn dict_str<'a>(
+        &mut self,
+        name: &'static str,
+        dict: impl Iterator<Item = &'a [u8]>,
+        valid: Option<&dyn Fn(usize) -> bool>,
+        idx: &dyn Fn(usize) -> u32,
+    ) -> std::io::Result<()> {
+        self.begin_col(name, Kind::Str, valid.is_some(), true);
+        let start = self.pos;
+        self.body.clear();
+        let mut nd = 0;
+        for s in dict {
+            self.body.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            self.body.extend_from_slice(s);
+            nd += 1;
+        }
+        let off = self.page(Some(nd))?;
+        self.cols.last_mut().unwrap().dict_off = off;
+        self.dict_data(nd, valid, idx)?;
+        self.end_col(start);
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> std::io::Result<()> {
+        let mut t = T::new();
+        t.i32f(1, 1);
+        t.list(2, 12, self.cols.len() + 1);
         t.begin_elem();
-        match c {
-            Col::I32 { name, date, .. } => {
-                t.i32f(1, 1);
-                t.i32f(3, 0);
-                t.strf(4, name.as_bytes());
-                if *date {
+        t.strf(4, b"schema");
+        t.i32f(5, self.cols.len() as i32);
+        t.end();
+        for c in &self.cols {
+            t.begin_elem();
+            match c.kind {
+                Kind::I64 => {
+                    t.i32f(1, 2);
+                    t.i32f(3, c.optional as i32);
+                    t.strf(4, c.name.as_bytes());
+                }
+                Kind::Date => {
+                    t.i32f(1, 1);
+                    t.i32f(3, c.optional as i32);
+                    t.strf(4, c.name.as_bytes());
                     t.i32f(6, 6);
                     t.begin(10);
                     t.begin(6);
                     t.end();
                     t.end();
                 }
+                Kind::Str => {
+                    t.i32f(1, 6);
+                    t.i32f(3, c.optional as i32);
+                    t.strf(4, c.name.as_bytes());
+                    t.i32f(6, 0);
+                    t.begin(10);
+                    t.begin(1);
+                    t.end();
+                    t.end();
+                }
             }
-            Col::I64 { name, .. } => {
-                t.i32f(1, 2);
-                t.i32f(3, 0);
-                t.strf(4, name.as_bytes());
-            }
-            Col::Str { name, valid, .. } => {
-                t.i32f(1, 6);
-                t.i32f(3, if valid.is_some() { 1 } else { 0 });
-                t.strf(4, name.as_bytes());
-                t.i32f(6, 0);
-                t.begin(10);
-                t.begin(1);
-                t.end();
-                t.end();
-            }
+            t.end();
         }
-        t.end();
-    }
-    t.i64f(3, nrows as i64);
-    t.list(4, 12, 1);
-    t.begin_elem();
-    t.list(1, 12, metas.len());
-    let mut total = 0i64;
-    for m in &metas {
+        t.i64f(3, self.nrows as i64);
+        t.list(4, 12, 1);
         t.begin_elem();
-        t.i64f(2, m.offset);
-        t.begin(3);
-        t.i32f(1, m.ptype);
-        t.list(2, 5, 2);
-        t.zz(0);
-        t.zz(3);
-        t.list(3, 8, 1);
-        t.varint(m.name.len() as u64);
-        t.b.extend_from_slice(m.name.as_bytes());
-        t.i32f(4, 0);
-        t.i64f(5, m.num_values);
-        t.i64f(6, m.size);
-        t.i64f(7, m.size);
-        t.i64f(9, m.offset);
+        t.list(1, 12, self.cols.len());
+        let mut total = 0i64;
+        for c in &self.cols {
+            t.begin_elem();
+            t.i64f(2, if c.dict { c.dict_off } else { c.data_off });
+            t.begin(3);
+            t.i32f(1, match c.kind {
+                Kind::I64 => 2,
+                Kind::Date => 1,
+                Kind::Str => 6,
+            });
+            if c.dict {
+                t.list(2, 5, 3);
+                t.zz(0);
+                t.zz(3);
+                t.zz(8);
+            } else {
+                t.list(2, 5, 2);
+                t.zz(0);
+                t.zz(3);
+            }
+            t.list(3, 8, 1);
+            t.varint(c.name.len() as u64);
+            t.b.extend_from_slice(c.name.as_bytes());
+            t.i32f(4, 0);
+            t.i64f(5, self.nrows as i64);
+            t.i64f(6, c.size);
+            t.i64f(7, c.size);
+            t.i64f(9, c.data_off);
+            if c.dict {
+                t.i64f(11, c.dict_off);
+            }
+            t.end();
+            t.end();
+            total += c.size;
+        }
+        t.i64f(2, total);
+        t.i64f(3, self.nrows as i64);
         t.end();
-        t.end();
-        total += m.size;
+        t.strf(6, b"fastsess");
+        t.b.push(0);
+        self.f.write_all(&t.b)?;
+        self.f.write_all(&(t.b.len() as u32).to_le_bytes())?;
+        self.f.write_all(b"PAR1")?;
+        self.f.flush()
     }
-    t.i64f(2, total);
-    t.i64f(3, nrows as i64);
-    t.end();
-    t.strf(6, b"fastsess");
-    t.b.push(0);
-    f.extend_from_slice(&t.b);
-    f.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
-    f.extend_from_slice(b"PAR1");
-    std::fs::write(path, &f)
 }

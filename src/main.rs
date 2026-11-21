@@ -387,20 +387,41 @@ fn main() {
         pbits,
     };
 
+    // fixed 2 MiB byte ranges; a worker moves both ends to line starts itself, so nothing
+    // touches the input before the readahead thread and the workers start
+    const CHUNK: usize = 2 << 20;
     let mut tasks: Vec<(u8, u32, usize, usize)> = Vec::new();
-    for (i, m) in ev_maps.iter().enumerate() {
-        for (s, e) in csv::chunks(m.bytes(), 2 << 20) {
-            tasks.push((0, i as u32, s, e));
-        }
-    }
-    for (i, m) in ck_maps.iter().enumerate() {
-        for (s, e) in csv::chunks(m.bytes(), 2 << 20) {
-            tasks.push((1, i as u32, s, e));
+    for (k, maps) in [&ev_maps, &ck_maps].into_iter().enumerate() {
+        for (i, m) in maps.iter().enumerate() {
+            let n = m.bytes().len();
+            for a in (0..n).step_by(CHUNK) {
+                tasks.push((k as u8, i as u32, a, (a + CHUNK).min(n)));
+            }
         }
     }
     let next = AtomicUsize::new(0);
     const GB: usize = 1 << 30;
     let (res1, links): (Vec<Out1>, Links) = std::thread::scope(|sc| {
+        // ask the kernel to read ahead in the order the input will be consumed (links first,
+        // they are built at the start); costs a page-cache lookup per page when already cached
+        {
+            let (tasks, ev_maps, ck_maps, lk_maps) = (&tasks, &ev_maps, &ck_maps, &lk_maps);
+            sc.spawn(move || {
+                let willneed = |d: &[u8], a: usize, b: usize| {
+                    let a = a & !4095;
+                    if b > a {
+                        unsafe { libc::madvise(d.as_ptr().add(a) as *mut libc::c_void, b - a, libc::MADV_WILLNEED) };
+                    }
+                };
+                for m in lk_maps.iter() {
+                    willneed(m.bytes(), 0, m.bytes().len());
+                }
+                for &(k, fi, a, b) in tasks.iter() {
+                    let d = if k == 0 { ev_maps[fi as usize].bytes() } else { ck_maps[fi as usize].bytes() };
+                    willneed(d, a, b);
+                }
+            });
+        }
         let hs: Vec<_> = (0..nt)
             .map(|w| {
                 let (cx, tasks, next, ev_maps, ck_maps, lk_maps) = (&cx, &tasks, &next, &ev_maps, &ck_maps, &lk_maps);
@@ -418,12 +439,17 @@ fn main() {
                         if t >= tasks.len() {
                             break;
                         }
-                        let (k, fi, s, e) = tasks[t];
+                        let (k, fi, a, b) = tasks[t];
                         let d = if k == 0 {
                             ev_maps[fi as usize].bytes()
                         } else {
                             ck_maps[fi as usize].bytes()
                         };
+                        // this chunk owns the lines that start inside [a, b)
+                        let (s, e) = (csv::line_start(d, a), csv::line_start(d, b));
+                        if s >= e {
+                            continue;
+                        }
                         if k == 0 {
                             parse_events(d, s, e, cx, w as u32, &mut o);
                         } else {
@@ -648,8 +674,8 @@ fn main() {
                         }
                         st.process(&ein, &cin, p3, links, &cx.it);
                     }
-                    if !st.rows.day.is_empty() || w == 0 {
-                        out::write_user(&ud.join(format!("part-{:03}.parquet", w)), &st.rows, catnames).unwrap();
+                    if st.rows.len() > 0 || w == 0 {
+                        out::write_user(&ud.join(format!("part-{:03}.parquet", w)), &st.rows, catnames, p3.day0, p3.nd).unwrap();
                     }
                     st.rows = out::UserRows::new();
                     st
@@ -691,7 +717,7 @@ fn main() {
             }
         }
     }
-    out::write_campaign(&cd.join("part-000.parquet"), &crow).unwrap();
+    out::write_campaign(&cd.join("part-000.parquet"), &crow, day0, nd).unwrap();
     lap("campaign file");
     unsafe { libc::_exit(0) };
 }

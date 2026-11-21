@@ -1,91 +1,40 @@
+// block scanner: separator masks are computed once per 64-byte block and walked with tzcnt
 #[inline(always)]
-unsafe fn m64(p: *const u8) -> (u64, u64, u64) {
+unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
     let a = _mm256_loadu_si256(p as *const __m256i);
     let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
-    let nl = _mm256_set1_epi8(b'\n' as i8);
-    let cm = _mm256_set1_epi8(b',' as i8);
-    let qt = _mm256_set1_epi8(b'"' as i8);
-    let m = |v: __m256i, c: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c)) as u32 as u64;
-    (
-        m(a, nl) | (m(b, nl) << 32),
-        m(a, cm) | (m(b, cm) << 32),
-        m(a, qt) | (m(b, qt) << 32),
-    )
+    let m = |v: __m256i, c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64;
+    (m(a, b'\n') | (m(b, b'\n') << 32), m(a, b',') | (m(b, b',') << 32), m(a, b'"') | (m(b, b'"') << 32))
 }
 
 #[inline(always)]
-fn line<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], ls: usize, len: usize, mut cm: u128, qm: u128, f: &mut F) {
-    if cm.count_ones() as usize != NF - 1 {
+fn emit<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], ls: usize, le: usize, cuts: &[usize; 8], nc: usize, nq: u32, f: &mut F) {
+    if nc != NF - 1 {
         return;
     }
     let mut fields: [&[u8]; NF] = [&[]; NF];
-    let mut s = 0usize;
+    let mut s = ls;
     let mut k = 0u32;
     for i in 0..NF {
-        let e = if i + 1 < NF {
-            let t = cm.trailing_zeros() as usize;
-            cm &= cm - 1;
-            t
-        } else {
-            len
-        };
+        let e = if i + 1 < NF { cuts[i] } else { le };
         let q = unsafe {
-            let a = *data.get_unchecked(ls + s) == b'"';
-            let b = *data.get_unchecked((ls + e).wrapping_sub(1)) == b'"';
+            let a = *data.get_unchecked(s) == b'"';
+            let b = *data.get_unchecked(e.wrapping_sub(1)) == b'"';
             (a & b & (e >= s + 2)) as u32
         };
         k += q;
-        let fs = s + q as usize;
-        let fe = e - q as usize;
-        fields[i] = unsafe { data.get_unchecked(ls + fs..ls + fe) };
+        fields[i] = unsafe { data.get_unchecked(s + q as usize..e - q as usize) };
         s = e + 1;
     }
-    if qm.count_ones() != 2 * k {
+    if nq != 2 * k {
         return;
     }
     f(&fields);
 }
 
-fn slow_line<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], ls: usize, le: usize, f: &mut F) {
-    let l = &data[ls..le];
-    let mut ends = [0usize; 8];
-    let mut nf = 0;
-    for (i, &c) in l.iter().enumerate() {
-        if c == b',' {
-            if nf < 8 {
-                ends[nf] = i;
-            }
-            nf += 1;
-        }
-    }
-    if nf + 1 != NF {
-        return;
-    }
-    ends[nf] = l.len();
-    let mut fields: [&[u8]; NF] = [&[]; NF];
-    let mut s = 0;
-    let mut k = 0;
-    let q = l.iter().filter(|&&c| c == b'"').count();
-    for i in 0..NF {
-        let mut v = &l[s..ends[i]];
-        if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' {
-            k += 1;
-            v = &v[1..v.len() - 1];
-        }
-        fields[i] = v;
-        s = ends[i] + 1;
-    }
-    if q != 2 * k {
-        return;
-    }
-    f(&fields);
-}
-
-// needs 128 readable bytes past `end`, mmaps are padded for that
 #[inline(always)]
 pub fn scan<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], start: usize, end: usize, skip_first: bool, mut f: F) {
-    let n = data.len();
     let base = data.as_ptr();
     let mut pos = start;
     if skip_first {
@@ -94,34 +43,84 @@ pub fn scan<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], start: usize, 
             None => return,
         }
     }
-    while pos < end && pos + 128 <= n {
-        let p = unsafe { base.add(pos) };
-        let (nl0, cm0, qt0) = unsafe { m64(p) };
-        let (nl1, cm1, qt1) = unsafe { m64(p.add(64)) };
-        let nl = nl0 as u128 | ((nl1 as u128) << 64);
-        if nl != 0 {
-            let len = nl.trailing_zeros();
-            let mm = (1u128 << len) - 1;
-            let cm = (cm0 as u128 | ((cm1 as u128) << 64)) & mm;
-            let qm = (qt0 as u128 | ((qt1 as u128) << 64)) & mm;
-            line::<NF, F>(data, pos, len as usize, cm, qm, &mut f);
-            pos += len as usize + 1;
-            continue;
-        }
-        let le = match data[pos..end].iter().position(|&c| c == b'\n') {
-            Some(i) => pos + i,
-            None => end,
-        };
-        slow_line::<NF, F>(data, pos, le, &mut f);
-        pos = le + 1;
+    if pos >= end {
+        return;
     }
-    while pos < end {
-        let le = match data[pos..end].iter().position(|&c| c == b'\n') {
-            Some(i) => pos + i,
-            None => end,
+    let mut cuts = [0usize; 8];
+    let mut nc = 0usize;
+    let mut nq = 0u32;
+    let mut ls = pos;
+    let mut blk = pos;
+    let n = data.len();
+    loop {
+        let (nl, cm, qt) = if blk + 64 <= n {
+            unsafe { masks(base.add(blk)) }
+        } else {
+            let mut buf = [0u8; 64];
+            buf[..n - blk].copy_from_slice(&data[blk..]);
+            unsafe { masks(buf.as_ptr()) }
         };
-        slow_line::<NF, F>(data, pos, le, &mut f);
-        pos = le + 1;
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(base.add(blk + 1024) as *const i8, _MM_HINT_T0);
+        }
+        let mut sep = nl | cm;
+        let mut qrest = qt;
+        while sep != 0 {
+            let t = sep.trailing_zeros() as usize;
+            let bit = 1u64 << t;
+            sep &= sep - 1;
+            let p = blk + t;
+            if nl & bit == 0 {
+                if nc < 8 {
+                    cuts[nc] = p;
+                }
+                nc += 1;
+            } else {
+                let below = bit - 1;
+                nq += (qrest & below).count_ones();
+                qrest &= !below;
+                emit::<NF, F>(data, ls, p, &cuts, nc, nq, &mut f);
+                nc = 0;
+                nq = 0;
+                ls = p + 1;
+                if ls >= end {
+                    return;
+                }
+            }
+        }
+        nq += qrest.count_ones();
+        blk += 64;
+        if blk >= end {
+            if ls < end {
+                // final line without a newline
+                let mut cc = [0usize; 8];
+                let mut k = 0;
+                let mut q = 0u32;
+                for (i, &c) in data[ls..end].iter().enumerate() {
+                    if c == b',' {
+                        if k < 8 {
+                            cc[k] = ls + i;
+                        }
+                        k += 1;
+                    }
+                    q += (c == b'"') as u32;
+                }
+                emit::<NF, F>(data, ls, end, &cc, k, q, &mut f);
+            }
+            return;
+        }
+    }
+}
+
+// first line start at or after `x`
+pub fn line_start(d: &[u8], x: usize) -> usize {
+    if x == 0 || x >= d.len() {
+        return x.min(d.len());
+    }
+    match d[x - 1..].iter().position(|&c| c == b'\n') {
+        Some(i) => x + i,
+        None => d.len(),
     }
 }
 

@@ -230,6 +230,8 @@ impl Sess {
             } else {
                 id_bytes(pk, it, &mut self.name);
             }
+            self.rows.names.push(&self.name);
+            self.rows.runs.push(0);
             let mut hi = 0usize;
             let mut cur_day: i64 = -1;
             let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
@@ -296,11 +298,11 @@ impl Sess {
                 };
                 if next_day != cur_day {
                     let r = &mut self.rows;
-                    r.user.push(&self.name);
-                    r.day.push((day0 + cur_day) as i32);
-                    r.sessions.push(d_sess);
-                    r.events.push(d_ev);
-                    r.revenue.push(d_rev);
+                    *r.runs.last_mut().unwrap() += 1;
+                    r.day.push(cur_day as u8);
+                    r.sessions.push(d_sess as u32);
+                    r.events.push(d_ev as u32);
+                    r.revenue.push(d_rev as u64);
                     let mut best: i32 = -1;
                     let mut bv = 0u64;
                     for &c in self.cat_touched.iter() {
@@ -312,7 +314,7 @@ impl Sess {
                         self.catsum[c as usize] = 0;
                     }
                     self.cat_touched.clear();
-                    r.topcat.push(best);
+                    r.topcat.push(if best < 0 { 255 } else { best as u8 });
                 }
                 i = j;
             }
