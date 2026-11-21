@@ -1,7 +1,3 @@
-// AVX2 line-at-a-time scanner for the rules.md CSV dialect.
-// For every well-formed data line with exactly NF fields, calls f(fields, line_start_offset)
-// with quotes stripped. Malformed lines are skipped.
-
 #[inline(always)]
 unsafe fn m64(p: *const u8) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
@@ -11,20 +7,13 @@ unsafe fn m64(p: *const u8) -> (u64, u64, u64) {
     let cm = _mm256_set1_epi8(b',' as i8);
     let qt = _mm256_set1_epi8(b'"' as i8);
     let m = |v: __m256i, c: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c)) as u32 as u64;
-    (m(a, nl) | (m(b, nl) << 32), m(a, cm) | (m(b, cm) << 32), m(a, qt) | (m(b, qt) << 32))
+    (
+        m(a, nl) | (m(b, nl) << 32),
+        m(a, cm) | (m(b, cm) << 32),
+        m(a, qt) | (m(b, qt) << 32),
+    )
 }
 
-#[inline(always)]
-fn low(n: u32) -> u128 {
-    if n >= 128 {
-        !0
-    } else {
-        (1u128 << n) - 1
-    }
-}
-
-/// Split one line (bytes [ls, ls+len) of `data`) given its comma/quote masks (relative to ls).
-/// Branch-free field and quote handling.
 #[inline(always)]
 fn line<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], ls: usize, len: usize, mut cm: u128, qm: u128, f: &mut F) {
     if cm.count_ones() as usize != NF - 1 {
@@ -58,7 +47,6 @@ fn line<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], ls: usize, len: us
     f(&fields);
 }
 
-/// Generic slow path for one line [ls, le) (long lines).
 fn slow_line<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], ls: usize, le: usize, f: &mut F) {
     let l = &data[ls..le];
     let mut ends = [0usize; 8];
@@ -94,7 +82,7 @@ fn slow_line<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], ls: usize, le
     f(&fields);
 }
 
-/// Scan data[start..end). `end` is just after a '\n' or the end of data.
+// needs 128 readable bytes past `end`, mmaps are padded for that
 #[inline(always)]
 pub fn scan<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], start: usize, end: usize, skip_first: bool, mut f: F) {
     let n = data.len();
@@ -106,10 +94,8 @@ pub fn scan<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], start: usize, 
             None => return,
         }
     }
-    // fast region: a full 128-byte window is readable
     while pos < end && pos + 128 <= n {
         let p = unsafe { base.add(pos) };
-        // always classify the full 128-byte window: no data-dependent branch on line length
         let (nl0, cm0, qt0) = unsafe { m64(p) };
         let (nl1, cm1, qt1) = unsafe { m64(p.add(64)) };
         let nl = nl0 as u128 | ((nl1 as u128) << 64);
@@ -122,7 +108,6 @@ pub fn scan<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], start: usize, 
             pos += len as usize + 1;
             continue;
         }
-        // long line
         let le = match data[pos..end].iter().position(|&c| c == b'\n') {
             Some(i) => pos + i,
             None => end,
@@ -130,7 +115,6 @@ pub fn scan<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], start: usize, 
         slow_line::<NF, F>(data, pos, le, &mut f);
         pos = le + 1;
     }
-    // tail: near the end of the file
     while pos < end {
         let le = match data[pos..end].iter().position(|&c| c == b'\n') {
             Some(i) => pos + i,
@@ -141,7 +125,6 @@ pub fn scan<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], start: usize, 
     }
 }
 
-/// Split [0, len) into chunks of about `target` bytes, each ending just after a '\n' (or at EOF).
 pub fn chunks(data: &[u8], target: usize) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let n = data.len();

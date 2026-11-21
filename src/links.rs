@@ -1,12 +1,3 @@
-// Linked IDs: fully parallel build.
-//   L1 parse link chunks (all threads)            -> per-worker edge lists
-//   L2 shard node tables by hash(key) (all threads) -> endpoint node ids
-//   L3 lock-free union-find over all edges (all threads)
-//   L4 component name = byte-wise min key (atomic fetch_min, exotic fix-up)
-//   L5 shard table values -> root node id
-// Person key for a linked ID = LINKED | root node id.
-
-use crate::arena::prefetch;
 use crate::csv;
 use crate::util::*;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -28,31 +19,15 @@ pub struct KTab {
 impl KTab {
     pub fn with_size_for(n: usize, load: f64) -> KTab {
         let size = (((n as f64) / load) as usize + 1).next_power_of_two().max(16);
-        KTab { mask: size - 1, slots: vec![Slot { k: EMPTY, v: 0, _p: 0 }; size] }
+        KTab {
+            mask: size - 1,
+            slots: vec![Slot { k: EMPTY, v: 0, _p: 0 }; size],
+        }
     }
     #[inline(always)]
     fn idx(&self, k: u64) -> usize {
         hash64b(k) as usize & self.mask
     }
-    #[inline(always)]
-    pub fn prefetch(&self, k: u64) {
-        prefetch(unsafe { self.slots.as_ptr().add(self.idx(k)) });
-    }
-    #[inline(always)]
-    pub fn get(&self, k: u64) -> Option<u32> {
-        let mut i = self.idx(k);
-        loop {
-            let s = unsafe { self.slots.get_unchecked(i) };
-            if s.k == k {
-                return Some(s.v);
-            }
-            if s.k == EMPTY {
-                return None;
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-    /// Returns (value, inserted).
     #[inline(always)]
     pub fn get_or_insert(&mut self, k: u64, v: u32) -> (u32, bool) {
         let mut i = self.idx(k);
@@ -72,29 +47,19 @@ impl KTab {
 }
 
 pub struct Links {
-    slots: Vec<Slot>, // s_count shards of (smask+1) slots each, contiguous (huge pages)
+    slots: Vec<Slot>,
     smask: usize,
     sbits_slots: u32,
     sshift: u32,
-    pub min_key: Vec<u64>, // by root node id
+    pub min_key: Vec<u64>,
     pub persons: usize,
 }
 
 impl Links {
-    // Bucketized: 4 slots (one 64-byte line) per bucket. One hash: top bits pick the shard,
-    // low bits the bucket. `locate` gives the slot index of the home bucket.
     #[inline(always)]
     pub fn locate(&self, k: u64) -> usize {
         let h = hash64(k);
         (((h >> self.sshift) as usize) << self.sbits_slots) | ((h as usize & self.smask) << 2)
-    }
-    #[inline(always)]
-    pub fn prefetch_at(&self, at: usize) {
-        prefetch(unsafe { self.slots.as_ptr().add(at) });
-    }
-    #[inline(always)]
-    pub fn prefetch(&self, k: u64) {
-        self.prefetch_at(self.locate(k));
     }
     #[inline(always)]
     pub fn person(&self, k: u64) -> u64 {
@@ -128,7 +93,7 @@ fn find(p: &[AtomicU32], mut x: u32) -> u32 {
         }
         let gp = p[px as usize].load(Relaxed);
         if gp != px {
-            p[x as usize].store(gp, Relaxed); // path halving: gp is an ancestor of x
+            p[x as usize].store(gp, Relaxed);
         }
         x = gp;
     }
@@ -167,8 +132,11 @@ fn par<F: Fn(usize) + Sync>(nt: usize, ntasks: usize, f: F) {
 pub fn build(maps: &[Mapped], it: &Interner, nt: usize) -> Links {
     let t0 = std::time::Instant::now();
     let vb = std::env::var("FS_VERBOSE").is_ok();
-    let lap = |n: &str| if vb { eprintln!("   links {:>7.1} ms {}", t0.elapsed().as_secs_f64()*1e3, n) };
-    // L1: parse, bucketing endpoints by shard
+    let lap = |n: &str| {
+        if vb {
+            eprintln!("   links {:>7.1} ms {}", t0.elapsed().as_secs_f64() * 1e3, n)
+        }
+    };
     let s_count: usize = 256;
     let sbits = s_count.trailing_zeros();
     let sshift = 64 - sbits;
@@ -180,7 +148,7 @@ pub fn build(maps: &[Mapped], it: &Interner, nt: usize) -> Links {
     }
     struct L1 {
         edges: Vec<(u64, u64)>,
-        buckets: Vec<Vec<(u64, u32)>>, // per shard: (key, endpoint index 2*i+side)
+        buckets: Vec<Vec<(u64, u32)>>,
     }
     let l1: Vec<Mutex<Option<L1>>> = (0..tasks.len()).map(|_| Mutex::new(None)).collect();
     par(nt, tasks.len(), |t| {
@@ -205,8 +173,10 @@ pub fn build(maps: &[Mapped], it: &Interner, nt: usize) -> Links {
     let nedges: usize = edges.iter().map(|v| v.len()).sum();
     lap("L1 parse");
 
-    // L2: shard node tables (each fits in L2)
-    let ends: Vec<Vec<AtomicU32>> = edges.iter().map(|v| (0..v.len() * 2).map(|_| AtomicU32::new(0)).collect()).collect();
+    let ends: Vec<Vec<AtomicU32>> = edges
+        .iter()
+        .map(|v| (0..v.len() * 2).map(|_| AtomicU32::new(0)).collect())
+        .collect();
     let shard_out: Vec<Mutex<Option<(KTab, Vec<u64>)>>> = (0..s_count).map(|_| Mutex::new(None)).collect();
     par(nt, s_count, |s| {
         let cnt: usize = l1.iter().map(|x| x.buckets[s].len()).sum();
@@ -233,7 +203,6 @@ pub fn build(maps: &[Mapped], it: &Interner, nt: usize) -> Links {
     let ngid = (maxl << sbits).max(1);
     assert!(ngid < u32::MAX as usize);
 
-    // L3: union-find
     let parent: Vec<AtomicU32> = (0..ngid as u32).map(AtomicU32::new).collect();
     let ntask3 = edges.len();
 
@@ -245,7 +214,6 @@ pub fn build(maps: &[Mapped], it: &Interner, nt: usize) -> Links {
     });
 
     lap("L3 uf");
-    // L4: component names
     let mink: Vec<AtomicU64> = (0..ngid).map(|_| AtomicU64::new(EMPTY)).collect();
     let exotic: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     let persons = AtomicUsize::new(0);
@@ -279,7 +247,6 @@ pub fn build(maps: &[Mapped], it: &Interner, nt: usize) -> Links {
     }
 
     lap("L4 names");
-    // L5: compact final map key -> root node id: equal-size shards of 4-slot buckets, contiguous
     let nbk = ((maxl as f64 / (4.0 * 0.7)) as usize + 1).next_power_of_two().max(4);
     let per = nbk * 4;
     let sbits_slots = per.trailing_zeros();
@@ -312,5 +279,12 @@ pub fn build(maps: &[Mapped], it: &Interner, nt: usize) -> Links {
     std::mem::forget(ends);
     std::mem::forget(skeys);
     std::mem::forget(l1);
-    Links { slots, smask, sbits_slots, sshift, min_key, persons: persons.into_inner() }
+    Links {
+        slots,
+        smask,
+        sbits_slots,
+        sshift,
+        min_key,
+        persons: persons.into_inner(),
+    }
 }

@@ -1,4 +1,3 @@
-# Shopping Sessions: native Rust pipeline, static binary in an empty image.
 FROM rust:1-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./

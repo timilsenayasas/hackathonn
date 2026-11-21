@@ -1,23 +1,20 @@
-// Per-partition sessionization, attribution and daily aggregation (shared by phases 2b and 3).
-
 use crate::links::Links;
 use crate::out::UserRows;
 use crate::util::*;
 
-/// Person-stream record.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct E2 {
     pub person: u64,
-    pub ts: u32,  // ms since window_start
-    pub pay: u32, // price (24 bits, 0 = not a purchase) | category rank << 24
+    pub ts: u32,
+    pub pay: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct C2 {
     pub person: u64,
     pub cid: u64,
-    pub ts: u32, // ms since window_start - 7d
+    pub ts: u32,
     pub camp: u32,
 }
 #[derive(Clone, Copy, Default)]
@@ -45,7 +42,6 @@ pub struct P3 {
 
 pub struct Sess {
     pub rows: UserRows,
-    // (campaign, day) accumulators, struct-of-arrays so the hot assist counter array stays small
     pub a_sess: Vec<u32>,
     pub a_purch: Vec<u32>,
     pub a_rev: Vec<u64>,
@@ -105,14 +101,12 @@ impl Sess {
         }
     }
 
-    /// All events (`ein`) and clicks (`cks`) of a set of complete persons.
-    pub fn process(&mut self, ein: &[E2], cks: &[C2], p: &P3, links: &Links, it: &Interner) {
-        let n = ein.len();
+    pub fn process(&mut self, ein: &[&[E2]], cks: &[&[C2]], p: &P3, links: &Links, it: &Interner) {
+        let n: usize = ein.iter().map(|s| s.len()).sum();
         if n == 0 {
             return;
         }
         let (ws, day0, nd, norg) = (p.ws, p.day0, p.nd, p.norg);
-        // ---- group events by person (open addressing, grown at 3/4 load)
         let mut size = (n / 8).next_power_of_two().max(256);
         let mut mask = size - 1;
         self.mk.clear();
@@ -122,7 +116,7 @@ impl Sess {
         self.li.clear();
         self.pkeys.clear();
         self.cnt.clear();
-        for e in ein.iter() {
+        for e in ein.iter().flat_map(|s| s.iter()) {
             let mut i = hash64(e.person) as usize & mask;
             let l = loop {
                 let k = unsafe { *self.mk.get_unchecked(i) };
@@ -171,18 +165,17 @@ impl Sess {
         self.e3.resize(n, E3::default());
         self.fill.clear();
         self.fill.extend_from_slice(&self.off[..np]);
-        for (j, e) in ein.iter().enumerate() {
+        for (j, e) in ein.iter().flat_map(|s| s.iter()).enumerate() {
             let l = self.li[j] as usize;
             let f = &mut self.fill[l];
             self.e3[*f as usize] = E3 { ts: e.ts, pay: e.pay };
             *f += 1;
         }
-        // ---- clicks of these persons
         self.ccnt.clear();
         self.ccnt.resize(np, 0);
         self.cli.clear();
         let mut nc = 0usize;
-        for c in cks.iter() {
+        for c in cks.iter().flat_map(|s| s.iter()) {
             let mut i = hash64(c.person) as usize & mask;
             let l = loop {
                 let k = self.mk[i];
@@ -211,15 +204,18 @@ impl Sess {
         self.c3.resize(nc, C3::default());
         self.fill.clear();
         self.fill.extend_from_slice(&self.coff[..np]);
-        for (j, c) in cks.iter().enumerate() {
+        for (j, c) in cks.iter().flat_map(|s| s.iter()).enumerate() {
             let l = self.cli[j];
             if l != u32::MAX {
                 let f = &mut self.fill[l as usize];
-                self.c3[*f as usize] = C3 { cid: c.cid, ts: c.ts, camp: c.camp };
+                self.c3[*f as usize] = C3 {
+                    cid: c.cid,
+                    ts: c.ts,
+                    camp: c.camp,
+                };
                 *f += 1;
             }
         }
-        // ---- per person
         for l in 0..np {
             let ev = &mut self.e3[self.off[l] as usize..self.off[l + 1] as usize];
             ev.sort_unstable_by_key(|e| e.ts);
@@ -263,7 +259,6 @@ impl Sess {
                 }
                 let nev = (j - i) as i64;
                 let day = (ws + s0 as i64).div_euclid(DAY_MS) - day0;
-                // credit: latest click with start-7d <= ts <= start (click frame = +7d); ties -> smallest click_id
                 let sc = s0 as u64 + WEEK as u64;
                 while hi < ck.len() && (ck[hi].ts as u64) <= sc {
                     hi += 1;
@@ -294,7 +289,11 @@ impl Sess {
                 d_sess += 1;
                 d_ev += nev;
                 d_rev += rev;
-                let next_day = if j < ev.len() { (ws + ev[j].ts as i64).div_euclid(DAY_MS) - day0 } else { -1 };
+                let next_day = if j < ev.len() {
+                    (ws + ev[j].ts as i64).div_euclid(DAY_MS) - day0
+                } else {
+                    -1
+                };
                 if next_day != cur_day {
                     let r = &mut self.rows;
                     r.user.push(&self.name);
@@ -317,14 +316,16 @@ impl Sess {
                 }
                 i = j;
             }
-            // assists: per campaign, merge click windows [t, t+7d] (click frame) and count
-            // the sessions per day whose start falls inside each merged window.
             if !ck.is_empty() {
                 let ns = self.sstart.len();
                 self.snext.clear();
                 self.snext.resize(ns, ns as u32);
                 for x in (0..ns.saturating_sub(1)).rev() {
-                    self.snext[x] = if self.sday[x + 1] != self.sday[x] { (x + 1) as u32 } else { self.snext[x + 1] };
+                    self.snext[x] = if self.sday[x + 1] != self.sday[x] {
+                        (x + 1) as u32
+                    } else {
+                        self.snext[x + 1]
+                    };
                 }
                 let (sstart, sday, snext, acc) = (&self.sstart, &self.sday, &self.snext, &mut self.a_assist);
                 let mut add = |c: usize, a: u64, b: u64| {

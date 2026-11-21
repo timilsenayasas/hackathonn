@@ -1,5 +1,3 @@
-// Per-thread bump arena on transparent huge pages + block-list radix scatter.
-
 pub struct Arena {
     base: *mut u8,
     cap: usize,
@@ -20,7 +18,11 @@ impl Arena {
             );
             assert!(p != libc::MAP_FAILED, "arena mmap failed");
             libc::madvise(p, cap, libc::MADV_HUGEPAGE);
-            Arena { base: p as *mut u8, cap, used: 0 }
+            Arena {
+                base: p as *mut u8,
+                cap,
+                used: 0,
+            }
         }
     }
     #[inline]
@@ -38,31 +40,41 @@ struct Tail<T> {
     end: *mut T,
 }
 
-/// P partitions, each a list of fixed-size blocks, filled through per-partition
-/// 64-byte write-combining lines flushed with non-temporal stores
-/// (when size_of::<T>() divides 64).
 pub struct Scatter<T: Copy> {
     tails: Vec<Tail<T>>,
-    blocks: Vec<Vec<(*mut T, usize)>>, // completed blocks per partition (ptr, len)
-    block: usize,                     // records per block (multiple of per_line)
-    wc: *mut u8,                      // P * 64 bytes, 64-aligned
+    blocks: Vec<Vec<(*mut T, usize)>>,
+    block: usize,
+    wc: *mut u8,
     wcn: Vec<u8>,
     per_line: usize,
-    pub cnt: Vec<u32>, // records pushed per partition (only maintained by push_counted)
+    pub cnt: Vec<u32>,
+    pub free: Vec<*mut u8>,
     pub arena: Arena,
 }
+
+pub const BLK: usize = 16 << 10;
 unsafe impl<T: Copy> Send for Scatter<T> {}
 unsafe impl<T: Copy> Sync for Scatter<T> {}
 
 impl<T: Copy> Scatter<T> {
-    pub fn new(parts: usize, block: usize, arena_bytes: usize) -> Self {
+    pub fn new(parts: usize, arena_bytes: usize) -> Self {
         let n = std::ptr::null_mut();
         let sz = std::mem::size_of::<T>();
         let per_line = if 64 % sz == 0 { 64 / sz } else { 0 };
         let mut arena = Arena::new(arena_bytes);
         let wc = arena.alloc(parts * 64);
-        let block = if per_line > 0 { (block + per_line - 1) / per_line * per_line } else { block };
-        Scatter { tails: vec![Tail { cur: n, end: n }; parts], blocks: (0..parts).map(|_| Vec::new()).collect(), block, wc, wcn: vec![0; parts], per_line, cnt: vec![0; parts], arena }
+        let block = BLK / sz;
+        Scatter {
+            tails: vec![Tail { cur: n, end: n }; parts],
+            blocks: (0..parts).map(|_| Vec::new()).collect(),
+            block,
+            wc,
+            wcn: vec![0; parts],
+            per_line,
+            cnt: vec![0; parts],
+            free: Vec::new(),
+            arena,
+        }
     }
     #[inline(always)]
     pub fn push(&mut self, p: usize, x: T) {
@@ -98,7 +110,6 @@ impl<T: Copy> Scatter<T> {
             }
         }
     }
-    /// Push and return the record's index within partition p (for this Scatter).
     #[inline(always)]
     pub fn push_counted(&mut self, p: usize, x: T) -> u32 {
         let i = unsafe { *self.cnt.get_unchecked(p) };
@@ -106,7 +117,6 @@ impl<T: Copy> Scatter<T> {
         self.push(p, x);
         i
     }
-    /// Flush partially filled write-combining lines. Call once, by the owner, before reading.
     pub fn finish(&mut self) {
         if self.per_line == 0 {
             return;
@@ -137,10 +147,24 @@ impl<T: Copy> Scatter<T> {
             let start = unsafe { t.end.sub(self.block) };
             self.blocks[p].push((start, self.block));
         }
-        let b = self.arena.alloc(self.block * std::mem::size_of::<T>()) as *mut T;
-        self.tails[p] = Tail { cur: b, end: unsafe { b.add(self.block) } };
+        let b = match self.free.pop() {
+            Some(b) => b as *mut T,
+            None => self.arena.alloc(BLK) as *mut T,
+        };
+        self.tails[p] = Tail {
+            cur: b,
+            end: unsafe { b.add(self.block) },
+        };
     }
-    /// All records of partition p as slices.
+    pub fn block_ptrs(&self, p: usize, out: &mut Vec<*mut u8>) {
+        for &(b, _) in &self.blocks[p] {
+            out.push(b as *mut u8);
+        }
+        let t = self.tails[p];
+        if !t.end.is_null() {
+            out.push(unsafe { t.end.sub(self.block) } as *mut u8);
+        }
+    }
     pub fn slices(&self, p: usize) -> impl Iterator<Item = &[T]> + '_ {
         let t = self.tails[p];
         let last: &[T] = if t.end.is_null() {
@@ -161,13 +185,6 @@ impl<T: Copy> Scatter<T> {
     }
 }
 
-#[inline(always)]
-pub fn prefetch<T>(p: *const T) {
-    unsafe { std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0) }
-}
-
-/// Global allocator: allocations >= 2 MiB go straight to 2 MiB-aligned mmap with
-/// MADV_HUGEPAGE (fewer TLB misses and page faults); everything else uses the system allocator.
 pub struct HugeAlloc;
 const HUGE: usize = 1 << 21;
 #[inline]
@@ -176,7 +193,14 @@ fn round_huge(n: usize) -> usize {
 }
 unsafe fn huge_map(size: usize) -> *mut u8 {
     let total = size + HUGE;
-    let p = libc::mmap(std::ptr::null_mut(), total, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
+    let p = libc::mmap(
+        std::ptr::null_mut(),
+        total,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+        -1,
+        0,
+    );
     if p == libc::MAP_FAILED {
         return std::ptr::null_mut();
     }
@@ -225,13 +249,12 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
             if a == b {
                 return p;
             }
-            let q = huge_map(b);
-            if q.is_null() {
-                return q;
+            let q = libc::mremap(p as *mut libc::c_void, a, b, libc::MREMAP_MAYMOVE);
+            if q == libc::MAP_FAILED {
+                return std::ptr::null_mut();
             }
-            std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
-            libc::munmap(p as *mut libc::c_void, a);
-            return q;
+            libc::madvise(q, b, libc::MADV_HUGEPAGE);
+            return q as *mut u8;
         }
         let nl = std::alloc::Layout::from_size_align_unchecked(new, l.align());
         let q = self.alloc(nl);
