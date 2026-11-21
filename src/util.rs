@@ -326,7 +326,7 @@ impl DateCache {
             }
             return None;
         }
-        parse_ts(s)
+        parse_ts_padded(s)
     }
 }
 
@@ -337,6 +337,37 @@ pub fn parse_f1_secs(s: &[u8]) -> Option<i64> {
         return None;
     }
     iso_secs(s)
+}
+
+/// 8 ASCII digits (first digit in the lowest byte, already validated) -> value.
+#[inline(always)]
+pub fn parse8(v: u64) -> u64 {
+    let v = v.wrapping_sub(0x3030_3030_3030_3030);
+    let v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    (((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000u64 << 32))).wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000u64 << 32)))) >> 32
+}
+
+/// parse_ts for fields inside padded mmaps: SWAR fast path for 13-digit epoch-ms values.
+#[inline(always)]
+pub fn parse_ts_padded(s: &[u8]) -> Option<i64> {
+    if s.len() == 13 {
+        unsafe {
+            let p = s.as_ptr();
+            let w1 = (p as *const u64).read_unaligned();
+            let w2 = (p.add(5) as *const u64).read_unaligned();
+            const K30: u64 = 0x3030_3030_3030_3030;
+            const K46: u64 = 0x4646_4646_4646_4646;
+            const K80: u64 = 0x8080_8080_8080_8080;
+            let bad = ((w1.wrapping_sub(K30) | w1.wrapping_add(K46)) | (w2.wrapping_sub(K30) | w2.wrapping_add(K46))) & K80;
+            if bad != 0 {
+                return None;
+            }
+            let hi = parse8(w1);
+            let lo = parse8((w2 & 0xFFFF_FFFF_FF00_0000) | 0x30_3030);
+            return Some((hi * 100_000 + lo) as i64);
+        }
+    }
+    parse_ts(s)
 }
 
 /// ts in F1/F2/F3 → epoch ms. None = bad. Huge F3 → None (outside any window).

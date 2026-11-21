@@ -109,19 +109,15 @@ pub fn scan<const NF: usize, F: FnMut(&[&[u8]; NF])>(data: &[u8], start: usize, 
     // fast region: a full 128-byte window is readable
     while pos < end && pos + 128 <= n {
         let p = unsafe { base.add(pos) };
+        // always classify the full 128-byte window: no data-dependent branch on line length
         let (nl0, cm0, qt0) = unsafe { m64(p) };
-        if nl0 != 0 {
-            let len = nl0.trailing_zeros();
-            let m = (1u64 << len) - 1;
-            line::<NF, F>(data, pos, len as usize, (cm0 & m) as u128, (qt0 & m) as u128, &mut f);
-            pos += len as usize + 1;
-            continue;
-        }
         let (nl1, cm1, qt1) = unsafe { m64(p.add(64)) };
-        if nl1 != 0 {
-            let len = 64 + nl1.trailing_zeros();
-            let cm = (cm0 as u128 | ((cm1 as u128) << 64)) & low(len);
-            let qm = (qt0 as u128 | ((qt1 as u128) << 64)) & low(len);
+        let nl = nl0 as u128 | ((nl1 as u128) << 64);
+        if nl != 0 {
+            let len = nl.trailing_zeros();
+            let mm = (1u128 << len) - 1;
+            let cm = (cm0 as u128 | ((cm1 as u128) << 64)) & mm;
+            let qm = (qt0 as u128 | ((qt1 as u128) << 64)) & mm;
             line::<NF, F>(data, pos, len as usize, cm, qm, &mut f);
             pos += len as usize + 1;
             continue;

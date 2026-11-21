@@ -48,6 +48,7 @@ pub struct Scatter<T: Copy> {
     wc: *mut u8,                      // P * 64 bytes, 64-aligned
     wcn: Vec<u8>,
     per_line: usize,
+    pub cnt: Vec<u32>, // records pushed per partition (only maintained by push_counted)
     pub arena: Arena,
 }
 unsafe impl<T: Copy> Send for Scatter<T> {}
@@ -61,7 +62,7 @@ impl<T: Copy> Scatter<T> {
         let mut arena = Arena::new(arena_bytes);
         let wc = arena.alloc(parts * 64);
         let block = if per_line > 0 { (block + per_line - 1) / per_line * per_line } else { block };
-        Scatter { tails: vec![Tail { cur: n, end: n }; parts], blocks: (0..parts).map(|_| Vec::new()).collect(), block, wc, wcn: vec![0; parts], per_line, arena }
+        Scatter { tails: vec![Tail { cur: n, end: n }; parts], blocks: (0..parts).map(|_| Vec::new()).collect(), block, wc, wcn: vec![0; parts], per_line, cnt: vec![0; parts], arena }
     }
     #[inline(always)]
     pub fn push(&mut self, p: usize, x: T) {
@@ -96,6 +97,14 @@ impl<T: Copy> Scatter<T> {
                 *self.wcn.get_unchecked_mut(p) = (k + 1) as u8;
             }
         }
+    }
+    /// Push and return the record's index within partition p (for this Scatter).
+    #[inline(always)]
+    pub fn push_counted(&mut self, p: usize, x: T) -> u32 {
+        let i = unsafe { *self.cnt.get_unchecked(p) };
+        unsafe { *self.cnt.get_unchecked_mut(p) = i + 1 };
+        self.push(p, x);
+        i
     }
     /// Flush partially filled write-combining lines. Call once, by the owner, before reading.
     pub fn finish(&mut self) {

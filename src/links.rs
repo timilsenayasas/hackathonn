@@ -85,7 +85,7 @@ impl Links {
     // low bits the bucket. `locate` gives the slot index of the home bucket.
     #[inline(always)]
     pub fn locate(&self, k: u64) -> usize {
-        let h = hash64b(k);
+        let h = hash64(k);
         (((h >> self.sshift) as usize) << self.sbits_slots) | ((h as usize & self.smask) << 2)
     }
     #[inline(always)]
@@ -195,8 +195,8 @@ pub fn build(maps: &[Mapped], it: &Interner, nt: usize) -> Links {
         });
         let mut buckets: Vec<Vec<(u64, u32)>> = (0..s_count).map(|_| Vec::with_capacity(v.len() * 2 / s_count + 8)).collect();
         for (j, &(a, b)) in v.iter().enumerate() {
-            buckets[(hash64b(a) >> sshift) as usize].push((a, (2 * j) as u32));
-            buckets[(hash64b(b) >> sshift) as usize].push((b, (2 * j + 1) as u32));
+            buckets[(hash64(a) >> sshift) as usize].push((a, (2 * j) as u32));
+            buckets[(hash64(b) >> sshift) as usize].push((b, (2 * j + 1) as u32));
         }
         *l1[t].lock().unwrap() = Some(L1 { edges: v, buckets });
     });
@@ -292,8 +292,8 @@ pub fn build(maps: &[Mapped], it: &Interner, nt: usize) -> Links {
             for (l, &k) in skeys[s].iter().enumerate() {
                 let g = ((l << sbits) | s) as u32;
                 let r = find(&parent, g);
-                debug_assert_eq!((hash64b(k) >> sshift) as usize, s);
-                let mut b = hash64b(k) as usize & smask;
+                debug_assert_eq!((hash64(k) >> sshift) as usize, s);
+                let mut b = hash64(k) as usize & smask;
                 'ins: loop {
                     for j in 0..4 {
                         if t[(b << 2) + j].k == EMPTY {
